@@ -1,5 +1,6 @@
 from .config import *
 from .model import BardGPT
+from .data import DataLoader
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +19,10 @@ def main() -> None:
     print(BANNER)
     model = BardGPT(BardGPTConfig())
     model.to(device=device)
-
+    optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
+    train_loader = DataLoader(B=B, T=T, split='train', device=device_type)
+    val_loader = DataLoader(B=B, T=T, split='val', device=device_type)
+            
     enc = tiktoken.get_encoding('gpt2')
 
     max_length = 30
@@ -30,15 +34,41 @@ def main() -> None:
     prompt.unsqueeze_(dim=0)
     prompt = prompt.repeat(num_return_sequences, 1)
 
-    with torch.inference_mode():
-        while prompt.size(-1) < max_length:
-            logits, _ = model(prompt)
-            logits = logits[:, -1, :]
-            probs = F.softmax(input=logits, dim=-1)
-            ix = torch.multinomial(input=probs, num_samples=1)
-            prompt = torch.cat((prompt, ix), dim=-1)
-    print(f'\n{'=' * 24} GENERATION {'=' * 24}')
-    for i in range(num_return_sequences):
-        decoded = enc.decode(prompt[i, :].tolist())
-        print(f'\nSAMPLE {i+1} {colors.OKGREEN}{decoded}{colors.ENDC}')
-    print(f'\n{'=' * 60}')
+    for step in range(max_steps):
+        last_step = (step == max_steps - 1)
+        if (step > 0 and step % 100 == 0) or last_step:
+            model.eval()
+            val_loader.reset()
+            with torch.inference_mode():
+                val_steps = 20
+                val_loss = 0.0
+                for _ in range(val_steps):
+                    x, y = val_loader.next_batch()
+                    _, loss = model(x, y)
+                    val_loss += loss.item() / val_steps
+                print(f'\nSTEP: {step:05d} | VAL LOSS: {loss.item():.6f}')
+
+        if (step > 0 and step % 250 == 0) or last_step:
+            model.eval()
+            x_gen = prompt.clone()
+            with torch.inference_mode():
+                while x_gen.size(-1) < max_length:
+                    logits, _ = model(x_gen)
+                    logits = logits[:, -1, :]
+                    probs = F.softmax(input=logits, dim=-1)
+                    ix = torch.multinomial(input=probs, num_samples=1)
+                    x_gen = torch.cat((x_gen, ix), dim=-1)
+            print(f'\n{'=' * 24} GENERATION {'=' * 24}')
+            for i in range(num_return_sequences):
+                decoded = enc.decode(x_gen[i, :].tolist())
+                print(f'\nSAMPLE {i+1} {colors.OKGREEN}{decoded}{colors.ENDC}')
+            print(f'\n{'=' * 60}')
+
+        model.train()
+        optimizer.zero_grad()
+        x, y = train_loader.next_batch()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f'\nSTEP: {step:05d} | TRAIN LOSS: {loss.item():.6f}')
+

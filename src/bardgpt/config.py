@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import torch
+import os
 
+proj_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 @dataclass
 class BardGPTConfig:
     vocab_size: int = 50_257
@@ -23,3 +25,6 @@ class colors:
 
 device = torch.accelerator.current_accelerator()
 device_type = torch.accelerator.current_accelerator()
+B = 4
+T = 32
+max_steps = 500
