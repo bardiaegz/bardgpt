@@ -28,3 +28,7 @@ device_type: str = device.type
 B = 4
 T = 32
 max_steps = 500
+warmup_steps = 20
+max_lr = 6e-4
+min_lr = 0.1 * max_lr
+weight_decay = 0.1

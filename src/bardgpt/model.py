@@ -79,7 +79,7 @@ class BardGPT(nn.Module):
                 nn.init.zeros_(tensor=module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(tensor=module.weight, mean=0.0, std=0.02)
-            
+
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f'cannot forward a sequence of length T ({T}), it should be less than block size ({self.config.block_size})'
@@ -95,3 +95,17 @@ class BardGPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(input=logits.view(-1, logits.size(-1)), target=targets.view(-1))
         return logits, loss
+
+    def configure_optimizer(self, weight_decay, learning_rate, device_type):
+        decay = [p for p in self.parameters() if p.requires_grad and p.dim() >= 2]
+        nodecay = [p for p in self.parameters() if p.requires_grad and p.dim() < 2]
+        
+        print(f'num decay parameters: {sum(p.numel() for p in decay):,}')
+        print(f'num no-decay parameters: {sum(p.numel() for p in nodecay):,}')
+                        
+        groups = [
+            {'params': decay, 'weight_decay': weight_decay},
+            {'params': nodecay, 'weight_decay': 0.0},
+        ]
+        fused = device_type == 'cuda'
+        return torch.optim.AdamW(groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused)

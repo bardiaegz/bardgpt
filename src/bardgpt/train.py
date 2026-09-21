@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import tiktoken
 from tqdm import tqdm
 import time
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 BANNER = r"""
   ____                _  _____ _____ _______ 
@@ -21,7 +22,10 @@ def main() -> None:
     print(BANNER)
     model = BardGPT(BardGPTConfig())
     model.to(device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
+    optimizer = model.configure_optimizer(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
+    linear = LinearLR(optimizer=optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
+    cosine = CosineAnnealingLR(optimizer=optimizer, T_max=max_steps-warmup_steps, eta_min=min_lr)
+    scheduler = SequentialLR(optimizer=optimizer, schedulers=[linear, cosine], milestones=[warmup_steps])
     train_loader = DataLoader(B=B, T=T, split='train', device=device_type)
     val_loader = DataLoader(B=B, T=T, split='val', device=device_type)
             
@@ -74,7 +78,9 @@ def main() -> None:
         logits, loss = model(x, y)
         loss.backward()
         norm = nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
+        lr = scheduler.get_last_lr()[0]
         optimizer.step()
+        scheduler.step()
         if device_type == 'cuda':
             torch.cuda.synchronize()
         elif device_type == 'mps':
@@ -87,4 +93,5 @@ def main() -> None:
                          val_loss=f'{val_loss:.6f}',
                          norm=f'{norm:.4f}',
                          dt=f'{int(dt*1000)}ms',
+                         lr=f'{lr:.6f}',
                          tok_sec=f'{tok_sec:.2f}')
