@@ -7,6 +7,7 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.c_attn = nn.Linear(in_features=config.n_embd, out_features=3 * config.n_embd)
         self.c_proj = nn.Linear(in_features=config.n_embd, out_features=config.n_embd)
+        self.c_proj.BARDGPT_SCALE_INIT = 1
         self.n_embd = config.n_embd
         self.n_head = config.n_head
 
@@ -29,6 +30,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(in_features=config.n_embd, out_features=config.expansion_factor * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(in_features=config.expansion_factor * config.n_embd, out_features=config.n_embd)
+        self.c_proj.BARDGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -65,6 +67,19 @@ class BardGPT(nn.Module):
 
         self.transformer.wte.weight = self.lm_head.weight
 
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'BARDGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            nn.init.normal_(tensor=module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(tensor=module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(tensor=module.weight, mean=0.0, std=0.02)
+            
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f'cannot forward a sequence of length T ({T}), it should be less than block size ({self.config.block_size})'
