@@ -1,0 +1,24 @@
+[project]
+name = "bardgpt"
+version = "0.1.0"
+description = "An LLM from scratch written in PyTorch"
+readme = "README.md"
+authors = [
+    { name = "Bardia Emamgholizadeh", email = "hi@bardiaegz.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=5.0.1",
+    "numpy>=2.5.3",
+    "requests>=2.34.2",
+    "tiktoken>=0.14.0",
+    "torch>=2.14.0",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+bardgpt = "bardgpt:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
