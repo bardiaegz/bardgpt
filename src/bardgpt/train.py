@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tiktoken
+from tqdm import tqdm
+import time
 
 BANNER = r"""
   ____                _  _____ _____ _______ 
@@ -34,7 +36,9 @@ def main() -> None:
     prompt.unsqueeze_(dim=0)
     prompt = prompt.repeat(num_return_sequences, 1)
 
-    for step in range(max_steps):
+    val_loss = float('nan')
+    pbar = tqdm(range(max_steps), desc='Training BardGPT', colour='#7BC621', dynamic_ncols=True)
+    for step in pbar:
         last_step = (step == max_steps - 1)
         if (step > 0 and step % 100 == 0) or last_step:
             model.eval()
@@ -46,7 +50,6 @@ def main() -> None:
                     x, y = val_loader.next_batch()
                     _, loss = model(x, y)
                     val_loss += loss.item() / val_steps
-                print(f'\nSTEP: {step:05d} | VAL LOSS: {loss.item():.6f}')
 
         if (step > 0 and step % 250 == 0) or last_step:
             model.eval()
@@ -65,10 +68,23 @@ def main() -> None:
             print(f'\n{'=' * 60}')
 
         model.train()
+        t0 = time.time()
         optimizer.zero_grad()
         x, y = train_loader.next_batch()
         logits, loss = model(x, y)
         loss.backward()
+        norm = nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
         optimizer.step()
-        print(f'\nSTEP: {step:05d} | TRAIN LOSS: {loss.item():.6f}')
-
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        elif device_type == 'mps':
+            torch.mps.synchronize()
+        t1 = time.time()
+        dt = t1 - t0
+        tokens_processed = train_loader.B * train_loader.T
+        tok_sec = tokens_processed / dt
+        pbar.set_postfix(train_loss=f'{loss.item():.6f}',
+                         val_loss=f'{val_loss:.6f}',
+                         norm=f'{norm:.4f}',
+                         dt=f'{int(dt*1000)}ms',
+                         tok_sec=f'{tok_sec:.2f}')

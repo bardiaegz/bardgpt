@@ -24,7 +24,7 @@ class colors:
     OKGREEN = '\033[38;2;123;198;33m'
 
 device = torch.accelerator.current_accelerator()
-device_type = torch.accelerator.current_accelerator()
+device_type: str = device.type
 B = 4
 T = 32
 max_steps = 500
