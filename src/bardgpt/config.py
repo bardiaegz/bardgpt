@@ -11,6 +11,7 @@ class BardGPTConfig:
     n_head: int = 12
     n_layer: int = 12
     expansion_factor: int = 4
+    eps: float = 1e-5
 
 class colors:
     HEADER = '\033[95m'

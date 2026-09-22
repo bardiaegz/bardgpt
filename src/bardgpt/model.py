@@ -2,6 +2,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+class RMSNorm(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(config.n_embd))
+        self.eps = config.eps
+
+    def forward(self, x: torch.Tensor):
+        rms = torch.rsqrt(self.eps + (x.pow(2).mean(dim=-1, keepdim=True)))
+        y = self.weight * rms * x
+        return y
+
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = int(2 / 3 * config.expansion_factor * config.n_embd)
+        self.w1 = nn.Linear(in_features=config.n_embd, out_features=hidden_dim)
+        self.w2 = nn.Linear(in_features=config.n_embd, out_features=hidden_dim)
+        self.w3 = nn.Linear(in_features=hidden_dim, out_features=config.n_embd)
+        self.w3.BARDGPT_SCALE_INIT = 1
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+    
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -27,6 +51,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+
         self.c_fc = nn.Linear(in_features=config.n_embd, out_features=config.expansion_factor * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(in_features=config.expansion_factor * config.n_embd, out_features=config.n_embd)
@@ -39,28 +64,44 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, norm='layer_norm', activation='gelu'):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(normalized_shape=config.n_embd)
-        self.attn = CausalSelfAttention(config=config)
-        self.ln_2 = nn.LayerNorm(normalized_shape=config.n_embd)
-        self.mlp = MLP(config=config)
 
+        assert norm in {'layer_norm', 'rmsnorm'}
+        assert activation in {'gelu', 'swiglu'}
+
+        if norm == 'layer_norm':
+            self.ln_1 = nn.LayerNorm(normalized_shape=config.n_embd)
+            self.ln_2 = nn.LayerNorm(normalized_shape=config.n_embd)
+
+        elif norm == 'rmsnorm':
+            self.ln_1 = RMSNorm(config=config)
+            self.ln_2 = RMSNorm(config=config)
+
+        self.attn = CausalSelfAttention(config=config)
+
+        if activation == 'gelu':
+            self.mlp = MLP(config=config)
+        elif activation == 'swiglu':
+            self.mlp = SwiGLU(config=config)
+            
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
 class BardGPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, norm='layer_norm', activation='gelu'):
         super().__init__()
         self.config = config
 
+        assert norm in {'layer_norm', 'rmsnorm'}
+        assert activation in {'gelu', 'swiglu'}
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(num_embeddings=config.vocab_size, embedding_dim=config.n_embd),
             wpe = nn.Embedding(num_embeddings=config.block_size, embedding_dim=config.n_embd),
-            h = nn.ModuleList(Block(config=config) for _ in range(config.n_layer)),
-            ln_f = nn.LayerNorm(normalized_shape=config.n_embd),
+            h = nn.ModuleList(Block(config=config, norm=norm, activation=activation) for _ in range(config.n_layer)),
+            ln_f = nn.LayerNorm(normalized_shape=config.n_embd) if norm == 'layer_norm' else RMSNorm(config),
         ))
 
         self.lm_head = nn.Linear(in_features=config.n_embd, out_features=config.vocab_size, bias=False)
