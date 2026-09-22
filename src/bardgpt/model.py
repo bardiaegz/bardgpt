@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+# RMSNorm: Root Mean Square Layer Normalization -> https://arxiv.org/pdf/1910.07467
 class RMSNorm(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -14,9 +14,13 @@ class RMSNorm(nn.Module):
         y = self.weight * rms * x
         return y
 
+# SwiGLU: GLU Variants Improve Transformer -> https://arxiv.org/pdf/2002.05202
 class SwiGLU(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # 2/3 factor from LLaMA paper §2.2
+        # keeps params equal to a 2-matrix FFN, since SwiGLU needs 3: 3 * 2/3 * 4d == 2 * 4d
+        # (LLaMA): Open and Efficient Foundation Language Models -> https://arxiv.org/abs/2302.13971
         hidden_dim = int(2 / 3 * config.expansion_factor * config.n_embd)
         self.w1 = nn.Linear(in_features=config.n_embd, out_features=hidden_dim)
         self.w2 = nn.Linear(in_features=config.n_embd, out_features=hidden_dim)
@@ -25,7 +29,11 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
-    
+
+# Transformer: Attention Is All You Need -> https://arxiv.org/abs/1706.03762 
+# GPT-1: Improving Language Understanding by Generative Pre-Training -> https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf
+# GPT-2: Language Models are Unsupervised Multitask Learners -> https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+# GPT-3: Language Models are Few-Shot Learners -> https://arxiv.org/pdf/2005.14165
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -106,10 +114,15 @@ class BardGPT(nn.Module):
 
         self.lm_head = nn.Linear(in_features=config.n_embd, out_features=config.vocab_size, bias=False)
 
+        # weight tying: eq. (2) in GPT-1 paper uses the same W_e for the input
+        # embedding and the output projection -> P(u) = softmax(h_n W_e^T).
+        # Using the Output Embedding to Improve Language Models -> https://arxiv.org/abs/1608.05859
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
 
+    # std=0.02 from GPT-1 §4.1 (Model specifications);
+    # residual scaling 1/sqrt(N) from GPT-2 §2.3 (Model), N = 2 * n_layer
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
@@ -137,6 +150,7 @@ class BardGPT(nn.Module):
             loss = F.cross_entropy(input=logits.view(-1, logits.size(-1)), target=targets.view(-1))
         return logits, loss
 
+
     def configure_optimizer(self, weight_decay, learning_rate, device_type):
         decay = [p for p in self.parameters() if p.requires_grad and p.dim() >= 2]
         nodecay = [p for p in self.parameters() if p.requires_grad and p.dim() < 2]
@@ -149,4 +163,5 @@ class BardGPT(nn.Module):
             {'params': nodecay, 'weight_decay': 0.0},
         ]
         fused = device_type == 'cuda'
+        # Betas and Epsilon from Appendix B on GPT-3 paper.
         return torch.optim.AdamW(groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused)
