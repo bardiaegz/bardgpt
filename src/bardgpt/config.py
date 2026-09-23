@@ -33,3 +33,6 @@ warmup_steps = 20
 max_lr = 6e-4
 min_lr = 0.1 * max_lr
 weight_decay = 0.1
+temperature = 1
+k = 50
+p = 0.9

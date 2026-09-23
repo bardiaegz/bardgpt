@@ -62,9 +62,27 @@ def main() -> None:
                 while x_gen.size(-1) < max_length:
                     logits, _ = model(x_gen)
                     logits = logits[:, -1, :]
-                    probs = F.softmax(input=logits, dim=-1)
-                    ix = torch.multinomial(input=probs, num_samples=1)
-                    x_gen = torch.cat((x_gen, ix), dim=-1)
+                    if temperature == 0:
+                        xcol = logits.argmax(dim=-1, keepdim=True)
+                    else:
+                        logits = logits / temperature
+                        probs = F.softmax(input=logits, dim=-1)
+                        topk_probs, topk_indices = torch.topk(input=probs, k=k, dim=-1)
+
+                        # top-p (nucleus): keep the smallest prefix whose mass reaches p.
+                        # torch.topk already returns descending order, so cumsum is the
+                        # running mass. shift the mask right by one so the token that
+                        # crosses p is KEPT, otherwise a single token with prob > p
+                        # would mask the whole row. https://arxiv.org/abs/1904.09751
+                        cumsum = torch.cumsum(input=topk_probs, dim=-1)
+                        remove = cumsum - topk_probs > p
+                        topk_probs = topk_probs.masked_fill(mask=remove, value=0.0)
+                        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+
+                        ix = torch.multinomial(input=topk_probs, num_samples=1)
+                        xcol = torch.gather(input=topk_indices, dim=-1, index=ix)
+                    x_gen = torch.cat((x_gen, xcol), dim=-1)
+                    
             print(f'\n{'=' * 24} GENERATION {'=' * 24}')
             for i in range(num_return_sequences):
                 decoded = enc.decode(x_gen[i, :].tolist())
@@ -77,6 +95,7 @@ def main() -> None:
         x, y = train_loader.next_batch()
         logits, loss = model(x, y)
         loss.backward()
+        # Appendix B on GPT-3 paper
         norm = nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
         lr = scheduler.get_last_lr()[0]
         optimizer.step()
