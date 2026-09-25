@@ -3,6 +3,11 @@ import torch
 import os
 
 proj_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+ckp_dir = os.path.join(proj_dir, 'checkpoint')
+log_dir = os.path.join(proj_dir, 'log')
+os.makedirs(ckp_dir, exist_ok=True)
+os.makedirs(log_dir, exist_ok=True)
+
 @dataclass
 class BardGPTConfig:
     vocab_size: int = 50_257
@@ -12,6 +17,8 @@ class BardGPTConfig:
     n_layer: int = 12
     expansion_factor: int = 4
     eps: float = 1e-5
+    norm: str = 'layer_norm'
+    activation: str = 'gelu'
 
 class colors:
     HEADER = '\033[95m'
@@ -36,3 +43,9 @@ weight_decay = 0.1
 temperature = 1
 k = 50
 p = 0.9
+max_length = 30
+num_return_sequences = 5
+
+max_steps = 500
+validation_eval_steps = 100
+generation_eval_steps = 250

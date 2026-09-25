@@ -72,9 +72,10 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config, norm='layer_norm', activation='gelu'):
+    def __init__(self, config):
         super().__init__()
 
+        norm, activation = config.norm, config.activation
         assert norm in {'layer_norm', 'rmsnorm'}
         assert activation in {'gelu', 'swiglu'}
 
@@ -99,17 +100,17 @@ class Block(nn.Module):
         return x
 
 class BardGPT(nn.Module):
-    def __init__(self, config, norm='layer_norm', activation='gelu'):
+    def __init__(self, config):
         super().__init__()
         self.config = config
 
-        assert norm in {'layer_norm', 'rmsnorm'}
-        assert activation in {'gelu', 'swiglu'}
+        assert config.norm in {'layer_norm', 'rmsnorm'}
+        assert config.activation in {'gelu', 'swiglu'}
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(num_embeddings=config.vocab_size, embedding_dim=config.n_embd),
             wpe = nn.Embedding(num_embeddings=config.block_size, embedding_dim=config.n_embd),
-            h = nn.ModuleList(Block(config=config, norm=norm, activation=activation) for _ in range(config.n_layer)),
-            ln_f = nn.LayerNorm(normalized_shape=config.n_embd) if norm == 'layer_norm' else RMSNorm(config),
+            h = nn.ModuleList(Block(config=config) for _ in range(config.n_layer)),
+            ln_f = nn.LayerNorm(normalized_shape=config.n_embd) if config.norm == 'layer_norm' else RMSNorm(config),
         ))
 
         self.lm_head = nn.Linear(in_features=config.n_embd, out_features=config.vocab_size, bias=False)
