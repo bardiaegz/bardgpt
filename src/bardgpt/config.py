@@ -35,6 +35,7 @@ device = torch.accelerator.current_accelerator()
 device_type: str = device.type
 B = 4
 T = 32
+total_batch_size = 1024
 max_steps = 500
 warmup_steps = 20
 max_lr = 6e-4

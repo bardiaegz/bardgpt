@@ -55,6 +55,7 @@ def main() -> None:
     parser.add_argument('--temperature', default=cfg.temperature, metavar='N.n', type=float, help='How much model creativity should be? I suggest not use number more than 2.')
     parser.add_argument('--top-k', default=cfg.k, type=int, metavar='N', help='Determine How many words does model should look at.')
     parser.add_argument('--top-p', default=cfg.p, type=float, metavar='N.n', help='Determine up to how much percentage does model should look at.')
+    parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='compile the model with torch.compile (--no-compile to disable)')
     parser.add_argument('--resume', nargs='?', const='latest', default=None, metavar='PATH', help='resume from a checkpoint; bare --resume picks the newest in checkpoint/')
     args = parser.parse_args()
 
@@ -126,7 +127,11 @@ def main() -> None:
     torch.set_float32_matmul_precision('high')
     model = BardGPT(model_config)
     model.to(device=device)
-    optimizer = model.configure_optimizer(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
+    # raw_model always refers to the real module. torch.compile returns a
+    # wrapper whose state_dict keys are prefixed '_orig_mod.', which would not
+    # load back into an uncompiled model -- so checkpointing uses raw_model.
+    raw_model = model
+    optimizer = raw_model.configure_optimizer(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
     linear = LinearLR(optimizer=optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
     cosine = CosineAnnealingLR(optimizer=optimizer, T_max=max_steps-warmup_steps, eta_min=min_lr)
     scheduler = SequentialLR(optimizer=optimizer, schedulers=[linear, cosine], milestones=[warmup_steps])
@@ -134,10 +139,15 @@ def main() -> None:
     train_loader = DataLoader(B=B, T=T, split='train', device=device_type)
     val_loader = DataLoader(B=B, T=T, split='val', device=device_type)
 
+    assert total_batch_size % (B * T) == 0, f'total batch size ({total_batch_size}) should be divisble to B * T ({B * T})'
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
     # restore everything else AFTER the generators are seeded above, otherwise
     # manual_seed would clobber the checkpoint's rng state.
     if ckpt is not None:
-        model.load_state_dict(ckpt['model'])
+        raw_model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
         train_loader.current_position = ckpt['train_position']
@@ -162,6 +172,10 @@ def main() -> None:
     prompt = prompt.repeat(num_return_sequences, 1)
 
 
+    if args.compile:
+        print('compiling model (first step will be slow)...')
+        model = torch.compile(model)
+
     pbar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc='Training BardGPT', colour='#7BC621', dynamic_ncols=True)
     for step in pbar:
         last_step = (step == max_steps - 1)
@@ -170,7 +184,7 @@ def main() -> None:
             val_loader.reset()
             with torch.inference_mode():
                 val_steps = 20
-                val_loss = 0.0
+                val_loss_accum = 0.0
                 for _ in range(val_steps):
                     x, y = val_loader.next_batch()
                     # BrainFloat-16 (BF16) -> Uses 1 sign bit, an 8-bit exponent (matching standard FP32), and a 7-bit mantissa for a total of 16 bits.
@@ -180,7 +194,8 @@ def main() -> None:
                     # https://arxiv.org/pdf/1905.12322
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                         _, loss = model(x, y)
-                    val_loss += loss.item() / val_steps
+                    val_loss_accum += loss.detach() / val_steps
+                val_loss = val_loss_accum.item()
                 log_file.write(f'\nSTEP {step:05d} | VAL LOSS: {val_loss:.6f}')
 
         if (step > 0 and step % generation_eval_steps == 0) or last_step:
@@ -194,7 +209,7 @@ def main() -> None:
                     if temperature == 0:
                         xcol = logits.argmax(dim=-1, keepdim=True)
                     else:
-                        logits = logits / temperaturelfmode
+                        logits = logits / temperature
                         probs = F.softmax(input=logits, dim=-1)
                         topk_probs, topk_indices = torch.topk(input=probs, k=k, dim=-1)
 
@@ -224,12 +239,16 @@ def main() -> None:
         model.train()
         t0 = time.time()
         optimizer.zero_grad()
-        x, y = train_loader.next_batch()
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss.backward()
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
         # Appendix B on GPT-3 paper
-        norm = nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
+        norm = nn.utils.clip_grad_norm_(parameters=raw_model.parameters(), max_norm=1.0)
         lr = scheduler.get_last_lr()[0]
         optimizer.step()
         scheduler.step()
@@ -239,10 +258,10 @@ def main() -> None:
             torch.mps.synchronize()
         t1 = time.time()
         dt = t1 - t0
-        tokens_processed = train_loader.B * train_loader.T
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
         tok_sec = tokens_processed / dt
-        log_file.write(f'\nSTEP {step:05d} | TRAIN LOSS: {loss.item():.6f} | NORM: {norm:.4f} | DT: {int(dt*1000)}ms | LR: {lr:.6f} | TOK/SEC: {tok_sec:.2f}')
-        pbar.set_postfix(train_loss=f'{loss.item():.6f}',
+        log_file.write(f'\nSTEP {step:05d} | TRAIN LOSS: {loss_accum.item():.6f} | NORM: {norm:.4f} | DT: {int(dt*1000)}ms | LR: {lr:.6f} | TOK/SEC: {tok_sec:.2f}')
+        pbar.set_postfix(train_loss=f'{loss_accum.item():.6f}',
                          val_loss=f'{val_loss:.6f}',
                          norm=f'{norm:.4f}',
                          dt=f'{int(dt*1000)}ms',
@@ -250,8 +269,8 @@ def main() -> None:
                          tok_sec=f'{tok_sec:.2f}')
         if (step > 0 and step % validation_eval_steps == 0) or last_step:
             checkpoint = {
-                'config': dataclasses.asdict(model.config),
-                'model': model.state_dict(),
+                'config': dataclasses.asdict(raw_model.config),
+                'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'step': step,
