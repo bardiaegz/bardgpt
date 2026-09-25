@@ -120,6 +120,10 @@ def main() -> None:
     else:
         model_config = BardGPTConfig(norm=norm, activation=activation)
 
+    # TensorFloat-32 (TF32) ->  Uses 1 sign bit, an 8-bit exponent (matching standard FP32), and a 10-bit mantissa (matching FP16/half precision) for a total of 19 bits.
+    # https://developer.nvidia.com/blog/accelerating-ai-training-with-tf32-tensor-cores/
+    # https://developer.nvidia.com/blog/getting-immediate-speedups-with-a100-tf32/
+    torch.set_float32_matmul_precision('high')
     model = BardGPT(model_config)
     model.to(device=device)
     optimizer = model.configure_optimizer(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
@@ -169,7 +173,13 @@ def main() -> None:
                 val_loss = 0.0
                 for _ in range(val_steps):
                     x, y = val_loader.next_batch()
-                    _, loss = model(x, y)
+                    # BrainFloat-16 (BF16) -> Uses 1 sign bit, an 8-bit exponent (matching standard FP32), and a 7-bit mantissa for a total of 16 bits.
+                    # https://en.wikipedia.org/wiki/Bfloat16_floating-point_format
+                    # https://www.cerebras.ai/blog/to-bfloat-or-not-to-bfloat-that-is-the-question
+                    # https://docs.cloud.google.com/tpu/docs/bfloat16
+                    # https://arxiv.org/pdf/1905.12322
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        _, loss = model(x, y)
                     val_loss += loss.item() / val_steps
                 log_file.write(f'\nSTEP {step:05d} | VAL LOSS: {val_loss:.6f}')
 
@@ -178,12 +188,13 @@ def main() -> None:
             x_gen = prompt.clone()
             with torch.inference_mode():
                 while x_gen.size(-1) < max_length:
-                    logits, _ = model(x_gen)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, _ = model(x_gen)
                     logits = logits[:, -1, :]
                     if temperature == 0:
                         xcol = logits.argmax(dim=-1, keepdim=True)
                     else:
-                        logits = logits / temperature
+                        logits = logits / temperaturelfmode
                         probs = F.softmax(input=logits, dim=-1)
                         topk_probs, topk_indices = torch.topk(input=probs, k=k, dim=-1)
 
@@ -214,7 +225,8 @@ def main() -> None:
         t0 = time.time()
         optimizer.zero_grad()
         x, y = train_loader.next_batch()
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
         # Appendix B on GPT-3 paper
         norm = nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=1.0)
