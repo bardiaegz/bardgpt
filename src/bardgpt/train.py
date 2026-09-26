@@ -1,7 +1,7 @@
 from .config import *
 from . import config as cfg
 from .model import BardGPT
-from .data import DataLoader
+from .data import DataLoader, DATASETS
 from .generate import generate
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ import dataclasses
 import os
 import argparse
 import textwrap
+import glob
 
 def main() -> None:
 
@@ -42,6 +43,7 @@ def main() -> None:
     parser.add_argument('--temperature', default=cfg.temperature, metavar='N.n', type=float, help='How much model creativity should be? I suggest not use number more than 2.')
     parser.add_argument('--top-k', default=cfg.k, type=int, metavar='N', help='Determine How many words does model should look at.')
     parser.add_argument('--top-p', default=cfg.p, type=float, metavar='N.n', help='Determine up to how much percentage does model should look at.')
+    parser.add_argument('--dataset', default='edufineweb', choices=DATASETS, metavar='edufineweb|tinyshakespeare', help='which corpus to train on')
     parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='compile the model with torch.compile (--no-compile to disable)')
     parser.add_argument('--resume', nargs='?', const='latest', default=None, metavar='PATH', help='resume from a checkpoint; bare --resume picks the newest in checkpoint/')
     args = parser.parse_args()
@@ -123,8 +125,8 @@ def main() -> None:
     cosine = CosineAnnealingLR(optimizer=optimizer, T_max=max_steps-warmup_steps, eta_min=min_lr)
     scheduler = SequentialLR(optimizer=optimizer, schedulers=[linear, cosine], milestones=[warmup_steps])
 
-    train_loader = DataLoader(B=B, T=T, split='train', device=device_type)
-    val_loader = DataLoader(B=B, T=T, split='val', device=device_type)
+    train_loader = DataLoader(B=B, T=T, split='train', device=device_type, dataset=args.dataset)
+    val_loader = DataLoader(B=B, T=T, split='val', device=device_type, dataset=args.dataset)
 
     assert total_batch_size % (B * T) == 0, f'total batch size ({total_batch_size}) should be divisble to B * T ({B * T})'
     grad_accum_steps = total_batch_size // (B * T)
@@ -137,7 +139,9 @@ def main() -> None:
         raw_model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
-        train_loader.current_position = ckpt['train_position']
+        assert ckpt.get('dataset', args.dataset) == args.dataset, (
+            f"checkpoint was trained on {ckpt['dataset']}, not {args.dataset}")
+        train_loader.set_state(ckpt.get('train_shard', 0), ckpt['train_position'])
         torch.set_rng_state(ckpt['rng_cpu'])
         if ckpt['rng_device'] is not None:
             if device_type == 'cuda':
@@ -162,6 +166,12 @@ def main() -> None:
     if args.compile:
         print('compiling model (first step will be slow)...')
         model = torch.compile(model)
+
+    best_ckp_path = os.path.join(ckp_dir, 'bardgpt-best.pt')
+    best_val_loss = float('inf')
+    if os.path.exists(best_ckp_path):
+        best_val_loss = torch.load(best_ckp_path, map_location='cpu')['val_loss']
+        print(f'existing best checkpoint has val loss {best_val_loss:.6f}')
 
     pbar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc='Training BardGPT', colour='#7BC621', dynamic_ncols=True)
     for step in pbar:
@@ -229,6 +239,7 @@ def main() -> None:
                          dt=f'{int(dt*1000)}ms',
                          lr=f'{lr:.6f}',
                          tok_sec=f'{tok_sec:.2f}')
+
         if (step > 0 and step % validation_eval_steps == 0) or last_step:
             checkpoint = {
                 'config': dataclasses.asdict(raw_model.config),
@@ -236,6 +247,8 @@ def main() -> None:
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'step': step,
+                'dataset': args.dataset,
+                'train_shard': train_loader.current_shard,
                 'train_position': train_loader.current_position,
                 'rng_cpu': torch.get_rng_state(),
                 'rng_device': torch.mps.get_rng_state() if device_type == 'mps' else (torch.cuda.get_rng_state_all() if device_type == 'cuda' else None),
@@ -244,5 +257,22 @@ def main() -> None:
             filename = os.path.join(ckp_dir, f'bardgpt-{step:05d}.pt')
             torch.save(obj=checkpoint, f=filename)
             print(f'\ncheckpoint saved to: {filename}')
+
+            # lower val loss is better. bardgpt-best.pt is a fixed name that is
+            # overwritten, so the "best" family never grows past one file.
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(obj=checkpoint, f=best_ckp_path)
+                print(f'new best val loss {val_loss:.6f} -> {best_ckp_path}')
+
+            # rotate the step checkpoints, keeping the newest keep_checkpoints.
+            # the glob excludes bardgpt-best.pt, so it is never deleted.
+            rotating = sorted(glob.glob(os.path.join(ckp_dir, 'bardgpt-[0-9]*.pt')))
+            for old_file in rotating[:-keep_checkpoints]:
+                try:
+                    os.remove(old_file)
+                    print(f'rotated out: {os.path.basename(old_file)}')
+                except OSError as e:
+                    print(f'could not delete {old_file}: {e.strerror}')
         log_file.flush()
     log_file.close()
