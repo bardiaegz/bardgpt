@@ -2,6 +2,7 @@ from .config import *
 from . import config as cfg
 from .model import BardGPT
 from .data import DataLoader
+from .generate import generate
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,20 +14,6 @@ import dataclasses
 import os
 import argparse
 import textwrap
-
-class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
-                    argparse.RawDescriptionHelpFormatter):
-    """Keeps the description's line breaks AND appends each option's default."""
-
-
-BANNER = r"""
-  ____                _  _____ _____ _______ 
- |  _ \              | |/ ____|  __ \__   __|
- | |_) | __ _ _ __ __| | |  __| |__) | | |   
- |  _ < / _` | '__/ _` | | |_ |  ___/  | |   
- | |_) | (_| | | | (_| | |__| | |      | |   
- |____/ \__,_|_|  \__,_|\_____|_|      |_|   
-"""
 
 def main() -> None:
 
@@ -42,7 +29,7 @@ def main() -> None:
                ''')
     )
 
-    parser.add_argument('--num-return-sequences', default=5, metavar='N', type=int, help=f'specify the number of sequences to generate in each {cfg.generation_eval_steps} steps')
+    parser.add_argument('-n', '--num-return-sequences', default=5, metavar='N', type=int, help=f'specify the number of sequences to generate in each {cfg.generation_eval_steps} steps')
     parser.add_argument('--norm', default='layer_norm', choices=('layer_norm', 'rmsnorm'), metavar='layer_norm|rmsnorm', help='choose how to normalize parameters')
     parser.add_argument('--activation', default='gelu', choices=('gelu', 'swiglu'), metavar='gelu|swiglu', help='choose what activation to use in the model')
     parser.add_argument('-B', '--batch-size', default=cfg.B, metavar='N', type=int, help='Choose batch size')
@@ -200,32 +187,7 @@ def main() -> None:
 
         if (step > 0 and step % generation_eval_steps == 0) or last_step:
             model.eval()
-            x_gen = prompt.clone()
-            with torch.inference_mode():
-                while x_gen.size(-1) < max_length:
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, _ = model(x_gen)
-                    logits = logits[:, -1, :]
-                    if temperature == 0:
-                        xcol = logits.argmax(dim=-1, keepdim=True)
-                    else:
-                        logits = logits / temperature
-                        probs = F.softmax(input=logits, dim=-1)
-                        topk_probs, topk_indices = torch.topk(input=probs, k=k, dim=-1)
-
-                        # top-p (nucleus): keep the smallest prefix whose mass reaches p.
-                        # torch.topk already returns descending order, so cumsum is the
-                        # running mass. shift the mask right by one so the token that
-                        # crosses p is KEPT, otherwise a single token with prob > p
-                        # would mask the whole row. https://arxiv.org/abs/1904.09751
-                        cumsum = torch.cumsum(input=topk_probs, dim=-1)
-                        remove = cumsum - topk_probs > p
-                        topk_probs = topk_probs.masked_fill(mask=remove, value=0.0)
-                        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
-
-                        ix = torch.multinomial(input=topk_probs, num_samples=1)
-                        xcol = torch.gather(input=topk_indices, dim=-1, index=ix)
-                    x_gen = torch.cat((x_gen, xcol), dim=-1)
+            x_gen = generate(model, prompt.clone(), max_length, temperature, k, p)
 
             log_file.write(f'\n{'=' * 24} GENERATION {'=' * 24}')
             print(f'\n{'=' * 24} GENERATION {'=' * 24}')

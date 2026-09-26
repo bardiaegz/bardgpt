@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import os
+import argparse
 
 proj_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 ckp_dir = os.path.join(proj_dir, 'checkpoint')
@@ -19,6 +20,21 @@ class BardGPTConfig:
     eps: float = 1e-5
     norm: str = 'layer_norm'
     activation: str = 'gelu'
+
+class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
+                    argparse.RawDescriptionHelpFormatter):
+    """Keeps the description's line breaks AND appends each option's default."""
+
+
+BANNER = r"""
+  ____                _  _____ _____ _______ 
+ |  _ \              | |/ ____|  __ \__   __|
+ | |_) | __ _ _ __ __| | |  __| |__) | | |   
+ |  _ < / _` | '__/ _` | | |_ |  ___/  | |   
+ | |_) | (_| | | | (_| | |__| | |      | |   
+ |____/ \__,_|_|  \__,_|\_____|_|      |_|   
+"""
+
 
 class colors:
     HEADER = '\033[95m'
