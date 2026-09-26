@@ -1,4 +1,5 @@
 from .config import *
+from .ddp import *
 from functools import cache
 import torch
 import tiktoken
@@ -36,10 +37,10 @@ class DataLoader:
     mid-epoch; tinyshakespeare simply always reports shard 0.
     """
 
-    def __init__(self, B, T, split='train', device='cpu', dataset='edufineweb'):
+    def __init__(self, B, T, process_rank, num_processes, split='train', device='cpu', dataset='edufineweb'):
         assert split in {'train', 'val'}
         assert dataset in DATASETS, f'dataset must be one of {DATASETS}'
-        self.B, self.T, self.split, self.device, self.dataset = B, T, split, device, dataset
+        self.B, self.T, self.process_rank, self.num_processes, self.split, self.device, self.dataset = B, T, process_rank, num_processes, split, device, dataset
 
         if dataset == 'tinyshakespeare':
             assert os.path.exists(input_file), f'{input_file} not found'
@@ -66,7 +67,7 @@ class DataLoader:
     def reset(self):
         self.current_shard = 0
         self.tokens = self._load(0)
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def set_state(self, shard, position):
         """Restore a checkpointed position, reloading the shard if needed."""
@@ -75,21 +76,23 @@ class DataLoader:
         if shard != self.current_shard:
             self.current_shard = shard
             self.tokens = self._load(shard)
-        self.current_position = position
+        # the checkpoint stores rank 0's position, so each rank re-applies its
+        # own stride offset -- otherwise every rank replays identical batches.
+        self.current_position = position + self.B * self.T * self.process_rank
 
     def next_batch(self):
-        B, T, device = self.B, self.T, self.device
+        B, T, process_rank, num_processes, device = self.B, self.T, self.process_rank, self.num_processes, self.device
 
         buf = self.tokens[self.current_position:self.current_position + B * T + 1]
         buf = buf.to(device=device)
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
 
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
 
-        if self.current_position + (B * T + 1) > len(self.tokens):
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.splits)
             self.tokens = self._load(self.current_shard)
-            self.current_position = 0
+            self.current_position = self.B * self.T * self.process_rank
 
         return x, y

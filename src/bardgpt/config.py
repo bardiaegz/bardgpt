@@ -47,8 +47,6 @@ class colors:
     UNDERLINE = '\033[4m'
     OKGREEN = '\033[38;2;123;198;33m'
 
-device = torch.accelerator.current_accelerator()
-device_type: str = device.type
 B = 4
 T = 32
 total_batch_size = 1024

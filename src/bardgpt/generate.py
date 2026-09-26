@@ -1,4 +1,5 @@
 from .config import *
+from .ddp import *
 from . import config as cfg
 from .model import BardGPT
 import torch

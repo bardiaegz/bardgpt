@@ -1,4 +1,5 @@
 from .config import *
+from .ddp import *
 from . import config as cfg
 from .model import BardGPT
 from .data import DataLoader, DATASETS
@@ -15,6 +16,9 @@ import os
 import argparse
 import textwrap
 import glob
+from torch.distributed import destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 def main() -> None:
 
@@ -77,7 +81,9 @@ def main() -> None:
     elif device_type == 'mps':
         torch.mps.manual_seed(seed=seed)
 
-    log_file = open(file=os.path.join(log_dir, f'bardgpt-log-{time.strftime("%Y%m%d-%H%M%S", time.gmtime())}.txt'), mode='w')
+    # only rank 0 writes a real log; other ranks discard, so 8 processes do not
+    log_file = (open(file=os.path.join(log_dir, f'bardgpt-log-{time.strftime("%Y%m%d-%H%M%S", time.gmtime())}.txt'), mode='w')
+                if master_process else open(os.devnull, 'w'))
     val_loss = float('nan')
     start_step = 0
 
@@ -119,19 +125,23 @@ def main() -> None:
     # raw_model always refers to the real module. torch.compile returns a
     # wrapper whose state_dict keys are prefixed '_orig_mod.', which would not
     # load back into an uncompiled model -- so checkpointing uses raw_model.
-    raw_model = model
+    if ddp:
+        model = DDP(module=model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
+
     optimizer = raw_model.configure_optimizer(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
     linear = LinearLR(optimizer=optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
     cosine = CosineAnnealingLR(optimizer=optimizer, T_max=max_steps-warmup_steps, eta_min=min_lr)
     scheduler = SequentialLR(optimizer=optimizer, schedulers=[linear, cosine], milestones=[warmup_steps])
 
-    train_loader = DataLoader(B=B, T=T, split='train', device=device_type, dataset=args.dataset)
-    val_loader = DataLoader(B=B, T=T, split='val', device=device_type, dataset=args.dataset)
+    train_loader = DataLoader(B=B, T=T, process_rank= ddp_rank, num_processes= ddp_world_size, split='train', device=device_type, dataset=args.dataset)
+    val_loader = DataLoader(B=B, T=T, process_rank= ddp_rank, num_processes= ddp_world_size, split='val', device=device_type, dataset=args.dataset)
 
-    assert total_batch_size % (B * T) == 0, f'total batch size ({total_batch_size}) should be divisble to B * T ({B * T})'
-    grad_accum_steps = total_batch_size // (B * T)
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    assert total_batch_size % (B * T * ddp_world_size) == 0, f'total batch size ({total_batch_size}) should be divisble to B * T * ddp_world_size ({B * T * ddp_world_size})'
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    if master_process:
+        print(f"total desired batch size: {total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # restore everything else AFTER the generators are seeded above, otherwise
     # manual_seed would clobber the checkpoint's rng state.
@@ -169,11 +179,11 @@ def main() -> None:
 
     best_ckp_path = os.path.join(ckp_dir, 'bardgpt-best.pt')
     best_val_loss = float('inf')
-    if os.path.exists(best_ckp_path):
+    if master_process and os.path.exists(best_ckp_path):
         best_val_loss = torch.load(best_ckp_path, map_location='cpu')['val_loss']
         print(f'existing best checkpoint has val loss {best_val_loss:.6f}')
 
-    pbar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc='Training BardGPT', colour='#7BC621', dynamic_ncols=True)
+    pbar = tqdm(range(start_step, max_steps), initial=start_step, total=max_steps, desc='Training BardGPT', colour='#7BC621', dynamic_ncols=True, disable=not master_process)
     for step in pbar:
         last_step = (step == max_steps - 1)
         if (step > 0 and step % validation_eval_steps == 0) or last_step:
@@ -192,12 +202,15 @@ def main() -> None:
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                         _, loss = model(x, y)
                     val_loss_accum += loss.detach() / val_steps
+                if ddp:
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
                 val_loss = val_loss_accum.item()
+
                 log_file.write(f'\nSTEP {step:05d} | VAL LOSS: {val_loss:.6f}')
 
-        if (step > 0 and step % generation_eval_steps == 0) or last_step:
-            model.eval()
-            x_gen = generate(model, prompt.clone(), max_length, temperature, k, p)
+        if ((step > 0 and step % generation_eval_steps == 0) or last_step) and master_process:
+            raw_model.eval()
+            x_gen = generate(raw_model, prompt.clone(), max_length, temperature, k, p)
 
             log_file.write(f'\n{'=' * 24} GENERATION {'=' * 24}')
             print(f'\n{'=' * 24} GENERATION {'=' * 24}')
@@ -214,11 +227,16 @@ def main() -> None:
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
             loss.backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
         # Appendix B on GPT-3 paper
         norm = nn.utils.clip_grad_norm_(parameters=raw_model.parameters(), max_norm=1.0)
         lr = scheduler.get_last_lr()[0]
@@ -230,7 +248,7 @@ def main() -> None:
             torch.mps.synchronize()
         t1 = time.time()
         dt = t1 - t0
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tok_sec = tokens_processed / dt
         log_file.write(f'\nSTEP {step:05d} | TRAIN LOSS: {loss_accum.item():.6f} | NORM: {norm:.4f} | DT: {int(dt*1000)}ms | LR: {lr:.6f} | TOK/SEC: {tok_sec:.2f}')
         pbar.set_postfix(train_loss=f'{loss_accum.item():.6f}',
@@ -240,7 +258,7 @@ def main() -> None:
                          lr=f'{lr:.6f}',
                          tok_sec=f'{tok_sec:.2f}')
 
-        if (step > 0 and step % validation_eval_steps == 0) or last_step:
+        if ((step > 0 and step % validation_eval_steps == 0) or last_step) and master_process:
             checkpoint = {
                 'config': dataclasses.asdict(raw_model.config),
                 'model': raw_model.state_dict(),
@@ -276,3 +294,5 @@ def main() -> None:
                     print(f'could not delete {old_file}: {e.strerror}')
         log_file.flush()
     log_file.close()
+    if ddp:
+        destroy_process_group()
