@@ -4,6 +4,7 @@ from . import config as cfg
 from .model import BardGPT
 from .data import DataLoader, DATASETS
 from .generate import generate
+from .hellaswag import evaluate as hellaswag_evaluate
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +48,8 @@ def main() -> None:
     parser.add_argument('--temperature', default=cfg.temperature, metavar='N.n', type=float, help='How much model creativity should be? I suggest not use number more than 2.')
     parser.add_argument('--top-k', default=cfg.k, type=int, metavar='N', help='Determine How many words does model should look at.')
     parser.add_argument('--top-p', default=cfg.p, type=float, metavar='N.n', help='Determine up to how much percentage does model should look at.')
+    parser.add_argument('--hellaswag-eval-steps', default=cfg.hellaswag_eval_steps, metavar='N', type=int, help='run HellaSwag every N steps; 0 disables it')
+    parser.add_argument('--hellaswag-limit', default=cfg.hellaswag_limit, metavar='N', type=int, help='examples to score per HellaSwag run (full set is 10,042)')
     parser.add_argument('--dataset', default='edufineweb', choices=DATASETS, metavar='edufineweb|tinyshakespeare', help='which corpus to train on')
     parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='compile the model with torch.compile (--no-compile to disable)')
     parser.add_argument('--resume', nargs='?', const='latest', default=None, metavar='PATH', help='resume from a checkpoint; bare --resume picks the newest in checkpoint/')
@@ -61,6 +64,10 @@ def main() -> None:
     max_steps = args.max_steps
     validation_eval_steps = args.validation_eval_steps
     generation_eval_steps = args.generation_eval_steps
+    hellaswag_eval_steps = args.hellaswag_eval_steps
+    hellaswag_limit = args.hellaswag_limit
+    assert hellaswag_eval_steps >= 0, 'hellaswag eval steps cannot be negative'
+    assert hellaswag_limit is None or hellaswag_limit > 0, 'hellaswag limit must be higher than 0'
     seed = args.seed
     assert args.lr > 0, 'Learning Rate must higher than 0.'
     max_lr = args.lr
@@ -177,6 +184,7 @@ def main() -> None:
         print('compiling model (first step will be slow)...')
         model = torch.compile(model)
 
+    hella = float('nan')
     best_ckp_path = os.path.join(ckp_dir, 'bardgpt-best.pt')
     best_val_loss = float('inf')
     if master_process and os.path.exists(best_ckp_path):
@@ -221,6 +229,15 @@ def main() -> None:
             log_file.write(f'\n{'=' * 60}')
             print(f'\n{'=' * 60}')
 
+        if hellaswag_eval_steps and ((step > 0 and step % hellaswag_eval_steps == 0) or last_step):
+            # raw_model, not the compiled one: examples have varying lengths,
+            # so a compiled model would recompile on every new shape.
+            acc, hella, n_eval = hellaswag_evaluate(raw_model, limit=hellaswag_limit)
+            if master_process:
+                line = f'STEP {step:05d} | HELLASWAG acc {acc*100:.2f}% | acc_norm {hella*100:.2f}% | n {n_eval}'
+                log_file.write(f'\n{line}')
+                print(f'\n{line}')
+
         model.train()
         t0 = time.time()
         optimizer.zero_grad()
@@ -253,6 +270,7 @@ def main() -> None:
         log_file.write(f'\nSTEP {step:05d} | TRAIN LOSS: {loss_accum.item():.6f} | NORM: {norm:.4f} | DT: {int(dt*1000)}ms | LR: {lr:.6f} | TOK/SEC: {tok_sec:.2f}')
         pbar.set_postfix(train_loss=f'{loss_accum.item():.6f}',
                          val_loss=f'{val_loss:.6f}',
+                         hella=f'{hella*100:.2f}%',
                          norm=f'{norm:.4f}',
                          dt=f'{int(dt*1000)}ms',
                          lr=f'{lr:.6f}',

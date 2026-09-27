@@ -62,6 +62,8 @@ max_length = 30
 num_return_sequences = 5
 
 max_steps = 500
+hellaswag_eval_steps = 250
+hellaswag_limit = 1000
 keep_checkpoints = 3
 validation_eval_steps = 100
 generation_eval_steps = 250
