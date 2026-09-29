@@ -21,6 +21,8 @@ bardgpt = "bardgpt:main"
 bardgpt-generate = "bardgpt.generate:main"
 bardgpt-data = "bardgpt.edufineweb:main"
 bardgpt-hellaswag = "bardgpt.hellaswag:main"
+bardgpt-lambada = "bardgpt.lambada:main"
+bardgpt-cbt = "bardgpt.cbt:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
